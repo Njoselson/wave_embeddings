@@ -40,8 +40,8 @@ class Config:
     vocab_size: int = 10000
     min_freq: int = 2
     window_size: int = 5
-    num_negatives: int = 5
-    batch_size: int = 512
+    num_negatives: int = 15
+    batch_size: int = 4096
     num_epochs: int = 20
     lr: float = 1e-3
     freq_lr: float = 3e-4
@@ -185,7 +185,9 @@ def main():
         dataset,
         batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
         drop_last=True,
     )
 
