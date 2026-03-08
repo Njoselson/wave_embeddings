@@ -1,10 +1,39 @@
-# Wave Embeddings v6 — Experimental Results
+# Wave Embeddings — Experimental Results
 
 ## Summary
 
-Wave Embeddings replace high-dimensional dense vectors (768+ params/token) with parametric wave representations using just **5 learnable parameters per token**. Each token is described as a superposition of sinusoidal waves at two frequency scales, and word similarity is computed via analytical wave interference energy rather than dot products.
+Wave Embeddings replace high-dimensional dense vectors (768+ params/token) with parametric wave representations. Each token is described as a superposition of sinusoidal waves, and word similarity is computed via analytical wave interference energy rather than dot products.
 
-This document reports results from contrastive (skip-gram) training on WikiText-2.
+This document covers the full experimental history across 4 architecture versions (v3–v6), trained on WikiText-2 and SST-2.
+
+## Architecture Evolution
+
+| Version | Params/Token | Level | Key Idea |
+|---------|-------------|-------|----------|
+| v3 | 6 | token | 3 complex exponential waves (f, A) |
+| v4 | 6/char | character | 3 waves per char, positional shift for word composition |
+| v5 | 2 | token | 1 frequency + 1 amplitude, 7 harmonics |
+| v6 | 5 | token | Dual-band (slow+fast), phase, diversity regularization |
+
+### v3: Complex Exponentials (Phase 0)
+- 3 waves × 2 params (f, A) = 6 params/token
+- Complex exponentials `A * exp(j * 2π * f * t)` — smooth loss landscape for frequency learning
+- **SST-2 accuracy: 82.3%** with ~64K total params
+- Key finding: complex exponentials enable frequency learning; real sinusoids do not (Hayes et al. 2022)
+
+### v4: Character-Level Waves
+- 3 waves per character, ~130 char vocab
+- Words composed by summing char signals with position-dependent frequency shift ("cat" ≠ "act")
+- Analytical sinc similarity — no time-domain sampling
+- Trained on WikiText-2, but character-level granularity limited semantic capture
+
+### v5: Single Frequency with Harmonics
+- 1 frequency + 1 amplitude per token = 2 params/token
+- 7 harmonics create multi-scale interaction: `Σ (A/h^decay) * exp(j·2π·h·f·t)`
+- Global learnable decay parameter controls harmonic richness
+- Both skip-gram and language model variants
+
+### v6: Multi-Scale Phase-Aware (Current)
 
 ## Architecture: v6 Multi-Scale Phase-Aware Wave Interference
 
@@ -47,7 +76,65 @@ For comparison, Word2Vec-300d uses 3,000,000 parameters for the same vocabulary.
 
 All training data (10.5M skip-gram pairs) and the negative sampling table (10M entries) were loaded directly onto GPU memory, eliminating CPU-GPU transfer overhead entirely. Negative sampling uses a word2vec-style unigram table for O(1) lookup instead of `np.random.choice`.
 
-## Results
+## v5 Results: Single Frequency with Harmonics
+
+Trained on an RTX A4000 (16GB) via vast.ai. 20 epochs, 3.2 hours, $0.26 total cost.
+
+### Language Model
+
+| Metric | Value |
+|--------|-------|
+| Parameters | 20,001 (10K tokens × 2 + 1 decay) |
+| Final Loss | 7.35 |
+| Final Perplexity | 1,563 |
+| Random baseline PPL | 10,000 |
+| **PPL improvement** | **6.4×** |
+
+The model beats random chance substantially. Decay self-organized from 1.5 → 0.304, meaning the model discovered it needs all 7 harmonics active (low decay = slow rolloff).
+
+### Word Similarity (v5)
+
+| Word Pair | Similarity | Notes |
+|-----------|-----------|-------|
+| war - battle | **+0.86** | Strong — synonyms/co-occurring |
+| city - town | **+0.49** | Strong — semantically close |
+| the - of | +0.45 | Function words cluster |
+| good - bad | +0.32 | Antonyms in same contexts |
+| king - queen | +0.03 | Weak |
+| man - woman | +0.01 | Near zero |
+| cat - dog | +0.00 | Near zero |
+| he - she | -0.01 | Near zero |
+
+**WordSim-353 Spearman rho: 0.23** (44 in-vocab pairs, p=0.125)
+
+### What v5 Revealed
+
+**Worked:** Co-occurrence relationships (war/battle appear in same Wikipedia articles). The sinc metric is meaningful — not random noise. Decay is a useful learnable parameter.
+
+**Failed:** Abstract semantic relationships (king/queen, gender pairs, morphology). With 1 frequency per token, the model has ~1 degree of freedom vs Word2Vec's 300. Nearest-neighbor lists were mostly noise — similarity scores clustered near 1.0 because frequency spread (std=3.05) is too narrow for sinc to discriminate.
+
+**Diagnosis:** The representation is too compressed. Need more params/token while keeping the wave interference framework.
+
+### Learned Parameters (v5)
+
+Selected words from `checkpoints/wave_v5_params.csv`:
+
+| Token | Frequency | Amplitude |
+|-------|-----------|-----------|
+| king | -2.22 | 0.28 |
+| queen | -3.02 | 0.25 |
+| man | 1.48 | 0.32 |
+| woman | -3.84 | 0.23 |
+| good | -1.30 | 0.13 |
+| great | 4.17 | 0.45 |
+| war | — | — |
+| the | -1.21 | 0.26 |
+
+Frequency range: [-10.93, 10.99], std=3.053. Some tokens learned negative amplitudes (unusual).
+
+---
+
+## v6 Results: Multi-Scale Phase-Aware
 
 ### Experiment 1: Without Phase Learning (phase initialized to zero)
 
@@ -170,6 +257,36 @@ See `wave_visualization.png` (without phase) and `wave_visualization_phase.png` 
 - Frequency spectra (slow + fast band harmonics)
 - Pairwise similarity heatmaps
 - Frequency landscape of all 10K vocabulary tokens
+
+## Gradient Diagnostics (v3–v5)
+
+Two diagnostic experiments (`diagnose_grads.py`, `diagnose_grads2.py`) investigated why frequencies were hard to train:
+
+1. **Frequency gradient magnitudes ~1000× smaller than amplitude gradients.** Cause: `sin(f)` provides poor gradients vs `exp(j·f)`. Solution: switch to complex exponentials in v3+.
+
+2. **Frequency std appeared static despite training.** Cause: initial frequency spread (linspace over large range) masks per-token movements. Per-token frequencies DO move (~0.001/step) but aggregate std is dominated by initialization. Conclusion: frequency IS learning, just hard to see in bulk stats — need to track per-token delta from init.
+
+## Cross-Version Comparison
+
+| Metric | v5 (2 params) | v6 no phase (5 params) | v6 with phase (5 params) |
+|--------|--------------|----------------------|------------------------|
+| good - great | — | **+0.84** | **+0.83** |
+| war - battle | **+0.86** | — | — |
+| city - town | **+0.49** | — | — |
+| king - queen | +0.03 | +0.00 | **+0.10** |
+| man - woman | +0.01 | -0.03 | **+0.84** |
+| cat - dog | +0.00 | +0.02 | -0.01 |
+| good - bad | +0.32 | -0.28 | +0.16 |
+| WS-353 rho | **0.23** | -0.08 | -0.06 |
+| LM PPL | 1,563 | — | — |
+| Params/token | 2 | 5 | 5 |
+
+**Paradox:** v5 scored higher on WS-353 (0.23) than v6 (-0.06) despite v6 having better hand-picked pairs. Possible explanations:
+- v5's LM training (cross-entropy on next-token) may provide stronger distributional signal than skip-gram
+- v6's frequency diversity regularizer may harm the broad similarity distribution while helping a few target pairs
+- v6's WS-353 eval may have different vocab coverage or parsing issues
+
+This warrants direct comparison under identical conditions.
 
 ## Formal Benchmark: WordSim-353
 
