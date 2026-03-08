@@ -266,7 +266,7 @@ def main():
         {"params": [model.embedding.decay], "lr": cfg.lr},
     ])
 
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     batches_per_epoch = len(loader)
     log.info("Training: %d epochs, %d batches/epoch, batch_size=%d, %d harmonics, chunk=%d",
