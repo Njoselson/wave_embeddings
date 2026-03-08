@@ -191,7 +191,82 @@ The model achieves near-zero (slightly negative) correlation with human similari
 
 This is an honest negative result. The architecture demonstrates that wave interference can capture *some* semantic structure, but the current formulation does not yet compete with dense embeddings on standard benchmarks.
 
+## Infrastructure: Training on Vast.ai
+
+All GPU training was done on [vast.ai](https://vast.ai), a marketplace for renting GPU instances. This section documents the setup and optimization process, which may be useful for reproducing results or running similar experiments.
+
+### Instance Setup
+
+- **GPU:** NVIDIA RTX 3060 Ti (8GB VRAM, $0.063/hr)
+- **Image:** `pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime`
+- **vCPUs:** 6, **RAM:** 32GB, **Storage:** 20GB
+- **Access:** SSH via `ssh -p <port> root@ssh<N>.vast.ai`
+
+### Deployment Workflow
+
+```bash
+# 1. Create instance via vast.ai CLI
+vastai show instances
+
+# 2. SSH in, clone repo, install deps
+ssh -p <port> root@ssh<N>.vast.ai
+git clone https://github.com/Njoselson/wave_embeddings.git
+cd wave_embeddings && pip install uv && uv sync
+
+# 3. Run training (background so SSH disconnect doesn't kill it)
+nohup uv run python experiments/train_contrastive_v6.py > /root/train.log 2>&1 &
+
+# 4. Monitor from local machine
+ssh -p <port> root@ssh<N>.vast.ai "tail -f /root/train.log"
+
+# 5. Pull checkpoint when done
+scp -P <port> root@ssh<N>.vast.ai:/root/wave_embeddings/checkpoints/wave_contrastive_v6.pt ./checkpoints/
+```
+
+### GPU Utilization Optimization Journey
+
+The contrastive training started at **9% GPU utilization** and was iteratively optimized to **97%**. The key lesson: for small models, the bottleneck is almost always data loading, not computation.
+
+#### Iteration 1: Baseline (9% GPU, ~7 min/epoch)
+- `batch_size=512`, `num_workers=0`
+- Single-threaded data loading on CPU, GPU starved between batches
+
+#### Iteration 2: More workers (21% GPU)
+- `batch_size=4096`, `num_workers=4`, `pin_memory=True`
+- CPU workers were at 97% each — `np.random.choice` with probability distribution is expensive per-sample
+
+#### Iteration 3: Unigram table (67% GPU, ~2 min/epoch)
+- Replaced `np.random.choice(p=probs)` with word2vec-style unigram lookup table (10M entries)
+- O(1) negative sampling instead of O(V) rejection sampling
+- Stored skip-gram pairs as contiguous numpy array
+
+#### Iteration 4: Full GPU-side data (97% GPU, ~2.6 min/epoch)
+- Loaded entire pairs tensor (10.5M pairs, ~80MB) directly onto GPU
+- Loaded negative sampling table (10M entries, ~80MB) onto GPU
+- Shuffling via `torch.randperm` on GPU
+- Negative sampling via `torch.randint` + table lookup on GPU
+- **Zero CPU-GPU transfer during training**
+- Attempted `batch_size=16384` but hit OOM at 8GB; settled on `batch_size=8192` (6.2GB used)
+
+**Result:** 7.7x speedup from baseline (7 min/epoch → 2.6 min/epoch), 10.8x GPU utilization improvement (9% → 97%).
+
+### Language Model Training: Memory Challenges
+
+The LM forward pass computes wave interference between every sequence position and every vocab token, requiring a cross-terms tensor of shape `(B, T, 2H, V, 2H)`. With V=10,000 and H=7, this is ~62M floats per batch chunk — too large for 8GB.
+
+**Attempted mitigations:**
+1. Reduced batch/seq/chunk sizes — still OOM due to autograd graph
+2. Rewrote cross-terms to loop over harmonic pairs (avoids 5D tensor) — still OOM from accumulated computation graph
+3. Reduced vocab to 3,000 — fit in memory but extremely slow (~13 hr/epoch)
+
+**Conclusion:** The wave LM architecture requires either >16GB VRAM, gradient checkpointing, or an approximate scoring mechanism to be practical. The contrastive (skip-gram) training is efficient; the LM scoring is the bottleneck.
+
+### Cost
+
+Total vast.ai compute cost for all experiments: approximately **$2-3** (RTX 3060 Ti at $0.063/hr for ~30-40 hours including idle time).
+
 ## Next Steps
+
 - Investigate frequency diversity regularizer scheduling (anneal weight to zero in later epochs)
 - Use wave embeddings as a frozen embedding layer in a small transformer to test downstream task performance
 - Explore approximate nearest-neighbor in frequency space for efficient LM scoring
