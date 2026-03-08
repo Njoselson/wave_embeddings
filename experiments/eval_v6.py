@@ -36,8 +36,8 @@ log = logging.getLogger(__name__)
 
 
 BENCHMARKS = {
-    "wordsim353": "https://raw.githubusercontent.com/alexanderpanchenko/sim-eval/master/datasets/wordsim353/wordsim353.tsv",
-    "simlex999": "https://raw.githubusercontent.com/alexanderpanchenko/sim-eval/master/datasets/simlex999/simlex999.tsv",
+    "wordsim353": "https://www.dropbox.com/s/eqal5qj97ajaycz/EN-WS353.txt?dl=1",
+    "simlex999": "https://www.dropbox.com/s/0jpa1x8vpmk3ych/EN-SIM999.txt?dl=1",
 }
 
 
@@ -193,7 +193,36 @@ def main():
         sys.exit(1)
 
     log.info("Loading: %s", args.checkpoint)
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    import pickle
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Config:
+        num_harmonics: int = 7
+        vocab_size: int = 10000
+        min_freq: int = 2
+        window_size: int = 5
+        num_negatives: int = 5
+        batch_size: int = 512
+        num_epochs: int = 20
+        lr: float = 1e-3
+        freq_lr: float = 3e-4
+        freq_diversity_weight: float = 0.01
+        eval_every: int = 5
+        use_wikitext: bool = True
+        device: str = "auto"
+
+    class _Unpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if name == "Config" and module == "__main__":
+                return _Config
+            return super().find_class(module, name)
+
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False,
+                      pickle_module=type("M", (), {
+                          "Unpickler": _Unpickler,
+                          "load": lambda f: _Unpickler(f).load(),
+                      }))
     vocab = ckpt["vocab"]
     config = ckpt["config"]
 

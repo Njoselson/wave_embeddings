@@ -25,6 +25,9 @@ from matplotlib.gridspec import GridSpec
 
 from src.wave_embedding_v6 import WaveEmbeddingV6, SkipGramV6, similarity
 
+# Import Config classes so torch.load can unpickle them
+from experiments.train_contrastive_v6 import Config as ContrastiveConfig  # noqa: F401
+
 
 DEFAULT_WORDS = [
     "king", "queen", "man", "woman",
@@ -34,7 +37,22 @@ DEFAULT_WORDS = [
 
 
 def load_checkpoint(path: str):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    import pickle
+    import io
+
+    # Patch unpickler to handle Config saved as __main__.Config
+    class _Unpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if name == "Config" and module == "__main__":
+                return ContrastiveConfig
+            return super().find_class(module, name)
+
+    with open(path, "rb") as f:
+        ckpt = torch.load(f, map_location="cpu", weights_only=False,
+                          pickle_module=type("M", (), {
+                              "Unpickler": _Unpickler,
+                              "load": lambda f: _Unpickler(f).load(),
+                          }))
     vocab = ckpt["vocab"]
     cfg = ckpt["config"]
     model = SkipGramV6(vocab_size=vocab.size, num_harmonics=cfg.num_harmonics)
