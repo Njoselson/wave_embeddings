@@ -216,9 +216,9 @@ def main():
     # GPU-optimized defaults
     if device.type == "cuda" and not args.quick:
         if args.batch_size is None:
-            cfg.batch_size = 128
+            cfg.batch_size = 64
         if args.chunk_size is None:
-            cfg.chunk_size = 64
+            cfg.chunk_size = 8
 
     # Mixed precision: enabled on CUDA by default, disabled elsewhere
     use_amp = device.type == "cuda" and not args.no_amp

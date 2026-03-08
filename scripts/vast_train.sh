@@ -23,8 +23,8 @@ python experiments/train_lm_v5.py \
     --device cuda \
     --epochs 20 \
     --vocab-size 10000 \
-    --batch-size 128 \
-    --chunk-size 64
+    --batch-size 64 \
+    --chunk-size 8
 
 echo ""
 echo "=== Training complete ==="
