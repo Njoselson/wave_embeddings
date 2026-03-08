@@ -72,61 +72,101 @@ Architecture evolved to v6: multi-scale (slow + fast bands), 7 harmonics per ban
 - 5 params/token learns a few strong relationships but doesn't generalize across benchmarks
 - Skip-gram on WikiText-2 may be insufficient signal for such compressed representations
 
+## Design Principles
+
+Every experiment going forward must be evaluated against these four criteria:
+
+1. **Training complexity** — Fewer hyperparameters, fewer optimizer groups, fewer interacting loss terms. v5 (2 params, 1 objective, 1 LR split) generalized better than v6 (5 params, 2 losses, 4 optimizer groups). Simplicity wins.
+
+2. **Objective function smoothness** — The loss landscape must be convex or near-convex in the parameters we care about. `sinc(x)` oscillates beyond the central lobe, creating local minima. `cos(phase)` has a saddle point at zero. LM cross-entropy is smoother than contrastive skip-gram with sinc scoring — this may explain why v5 LM (rho=0.23) beat v6 contrastive (rho=-0.06).
+
+3. **Learnability** — No conflicting gradients. v6's diversity regularizer fights the contrastive loss: one pushes frequencies apart, the other pulls co-occurring tokens together. When two loss terms compete, neither wins cleanly. A single well-designed objective is better than two that interfere.
+
+4. **Inference speed** — Wave embeddings are already fast: table lookup + sinc evaluations, no matrix multiplies. Must preserve this. The LM scoring bottleneck (O(T * V * H²)) must be solved without adding dense layers that negate the compression advantage.
+
+**Implication:** The next experiment should be the *simplest possible* change that addresses the v5→v6 regression, not the most feature-rich.
+
 ## Phase 1.5: Closing the Benchmark Gap (Current)
 
-**Goal:** Improve WordSim-353 from ~0 to >0.3 Spearman rho before moving to new tasks.
+**Goal:** Beat v5's WS-353 rho of 0.23. Target: >0.3.
 
-The v6 experiment showed the architecture *can* learn semantics but doesn't generalize. This phase addresses the likely causes.
+### The v5 vs v6 paradox
 
-### Increase model capacity
-- [ ] Increase params/token: try 10-20 params (more waves or higher-dim amplitudes)
-- [ ] Try 5-10 waves per band instead of 1 fundamental + harmonics
-- [ ] Experiment with per-harmonic phase (currently phase is shared across harmonics)
+v5 (2 params/token, LM objective) scored 0.23 on WS-353.
+v6 (5 params/token, skip-gram + diversity reg) scored -0.06.
 
-### Improve training signal
-- [ ] Train on larger corpus: full English Wikipedia (~100M tokens) instead of WikiText-2 (2M)
-- [ ] More epochs with learning rate scheduling (cosine or reduce-on-plateau)
-- [ ] Hard negative mining: sample negatives closer in frequency space for stronger gradients
-- [ ] Increase window size to capture broader context
+More params + more features = worse generalization. Three suspects:
+1. **Objective**: LM cross-entropy (v5) vs skip-gram contrastive (v6)
+2. **Regularizer**: v6's diversity loss fights the similarity objective
+3. **Architecture complexity**: v6 has too many interacting parts
 
-### Fix regularization
-- [ ] Anneal frequency diversity weight: full strength early, zero by final third of training
-- [ ] Or replace with softer constraint: minimize overlap of *unrelated* tokens only
-- [ ] Experiment with no diversity regularizer at all — let contrastive loss handle it
+### Experiment plan: isolate one variable at a time
 
-### Training dynamics
-- [ ] Warm up frequency learning rate (currently constant 3e-4)
-- [ ] Try AdamW or LAMB optimizer for better generalization
-- [ ] Add gradient noise to escape local minima in frequency space
-- [ ] Monitor per-pair similarity trajectories to detect and prevent late-training degradation
+**Experiment A: v5 architecture + skip-gram** (isolate objective)
+- [ ] Train v5 (2 params, 7 harmonics) with skip-gram objective (same as v6 training)
+- [ ] No diversity regularizer
+- [ ] Compare WS-353 rho against v5-LM (0.23) and v6-contrastive (-0.06)
+- [ ] If rho drops: LM objective is the key ingredient
+- [ ] If rho holds: v6's architecture/regularizer is the problem
 
-### Evaluation
+**Experiment B: v6 architecture + LM objective** (isolate architecture)
+- [ ] Train v6 (5 params, dual-band) with LM cross-entropy (same as v5 training)
+- [ ] No diversity regularizer
+- [ ] Compare against v5-LM (0.23)
+- [ ] If rho improves: more params + LM = the path forward
+- [ ] If rho drops: v6's added complexity (dual-band, phase) actively hurts
+
+**Experiment C: v6 skip-gram without diversity loss** (isolate regularizer)
+- [ ] Exact v6 contrastive setup but `freq_diversity_weight=0.0`
+- [ ] Quickest test — only changes one config value
+- [ ] If rho jumps: diversity loss was the problem all along
+
+**Run order:** C first (cheapest), then A, then B.
+
+### If the objective matters most (LM > skip-gram)
+
+The sinc scoring function in skip-gram may be the issue:
+- `sinc(2*Δf)` oscillates — two tokens with Δf=1.5 have *negative* sinc, creating false repulsion
+- LM cross-entropy uses sinc indirectly through logits, softmax smooths the landscape
+- Consider: replace sinc with Gaussian kernel `exp(-Δf²/σ²)` — monotonically decreasing, no oscillation, still differentiable
+
+### If capacity matters (need more params)
+
+Scale params/token gradually: 2 → 4 → 8 → 16. Don't jump to 5 with 3 new features at once.
+- [ ] v5 with 2 frequencies + 2 amplitudes = 4 params (simplest capacity increase)
+- [ ] v5 with 4 frequencies + 4 amplitudes = 8 params
+- [ ] Plot WS-353 rho vs params/token — find the knee
+
+### Evaluation improvements
 - [ ] Fix SimLex-999 parsing (format mismatch in current eval)
-- [ ] Add MEN-3000 and RareWords benchmarks
+- [ ] Ensure identical vocab coverage across v5 and v6 evals
 - [ ] Per-category analysis: which semantic relationships does wave interference capture vs miss?
 
 ## Phase 2: Language Modeling with Wave Embeddings
 
-**Goal:** Use wave embeddings for next-token prediction without requiring O(T * V * H^2) scoring.
+**Goal:** Use wave embeddings for next-token prediction without requiring O(T * V * H²) scoring.
 
-The v6 LM (`train_lm_v6.py`) computed full wave interference between every position and all vocab tokens — this was O(T * V * H^2) per forward pass and OOM'd on 8GB GPUs even with V=3000.
+v5 LM achieved PPL 1,563 (6.4× over random) but OOM'd v6 on 8GB. The scoring mechanism must be efficient.
 
-### Approach A: Wave embeddings as drop-in layer
-- [ ] Freeze trained wave embeddings, project to d-dim vector via small MLP
+### Approach A: Wave embeddings as drop-in layer (simplest, tests embedding quality)
+- [ ] Freeze trained wave embeddings, project to d-dim vector via small linear layer
 - [ ] Feed into standard small transformer (2-4 layers, d=128-256)
-- [ ] Compare perplexity vs randomly initialized embeddings of same dimensionality
-- [ ] This tests: do 5 learned wave params encode more than 5 random params?
+- [ ] Compare perplexity vs randomly initialized embeddings of same total param count
+- [ ] **Inference**: still fast — wave lookup + small linear projection + small transformer
+- [ ] **Complexity**: minimal — just add a projection layer, no new objectives
+- [ ] This answers: does the wave representation encode more information per parameter?
 
-### Approach B: Efficient wave LM
-- [ ] Approximate scoring: only compute interference with top-K candidates from frequency-space ANN
-- [ ] Or: use FFT-based fast interference computation (batch all vocab in Fourier domain)
-- [ ] Gradient checkpointing to reduce memory from autograd graph
-- [ ] Target: train on WikiText-2 with V=10K in <16GB VRAM
+### Approach B: Gaussian kernel scoring (smoother objective, same architecture)
+- [ ] Replace `sinc(2*Δf)` with `exp(-Δf²/σ²)` in the energy function
+- [ ] Monotonically decreasing with frequency distance — no oscillatory local minima
+- [ ] Same O(T*V*H²) cost but smoother loss landscape may allow larger learning rates
+- [ ] σ is a learnable or tunable parameter
 
-### Approach C: Wave-space autoregressive model
-- [ ] Context representation: decayed running wave (already implemented in WaveLMv6)
-- [ ] Prediction: learn a mapping from running wave → next token's wave params
-- [ ] Avoids scoring all vocab — predicts wave params directly, then nearest-neighbor lookup
+### Approach C: Predict wave params directly (fast inference)
+- [ ] Context → predicted (f, A) for next token via small MLP
+- [ ] Nearest-neighbor lookup in wave param space to find the token
+- [ ] **Inference**: O(V) distance comparisons in low-dim space, or O(log V) with ANN index
+- [ ] Avoids scoring all vocab through interference — decouples generation from wave math
 
 ## Phase 3: Multilingual & Universal Frequencies
 
