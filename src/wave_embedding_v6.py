@@ -359,6 +359,9 @@ class WaveLMv6(nn.Module):
     ):
         """Compute per-position phase-aware cross-terms with all candidates.
 
+        Memory-efficient: loops over harmonic pairs instead of materializing
+        a (B, chunk, 2H, V, 2H) tensor.
+
         Args:
             ctx_f, ctx_A, ctx_phi: (B, T, 2H) context token harmonics
             cand_f, cand_A, cand_phi: (V, 2H) candidate harmonics
@@ -372,19 +375,22 @@ class WaveLMv6(nn.Module):
 
         for t_start in range(0, T, chunk_size):
             t_end = min(t_start + chunk_size, T)
-            sf = ctx_f[:, t_start:t_end]       # (B, chunk, 2H)
-            sA = ctx_A[:, t_start:t_end]
-            sp = ctx_phi[:, t_start:t_end]
+            # Loop over context harmonics and candidate harmonics
+            # Each iteration: (B, chunk, 1) op (1, 1, V) → (B, chunk, V)
+            for i in range(H2):
+                sf_i = ctx_f[:, t_start:t_end, i]    # (B, chunk)
+                sA_i = ctx_A[:, t_start:t_end, i]
+                sp_i = ctx_phi[:, t_start:t_end, i]
+                for j in range(H2):
+                    cf_j = cand_f[:, j]    # (V,)
+                    cA_j = cand_A[:, j]
+                    cp_j = cand_phi[:, j]
 
-            # df: (B, chunk, 2H, V, 2H) — too big, do it with einsum-style
-            # Instead: (B, chunk, 2H, 1, 1) - (1, 1, 1, V, 2H)
-            df = sf[:, :, :, None, None] - cand_f[None, None, None, :, :]
-            dphi = sp[:, :, :, None, None] - cand_phi[None, None, None, :, :]
-            amp = sA[:, :, :, None, None] * cand_A[None, None, None, :, :]
+                    df = sf_i.unsqueeze(-1) - cf_j.unsqueeze(0).unsqueeze(0)      # (B, chunk, V)
+                    dphi = sp_i.unsqueeze(-1) - cp_j.unsqueeze(0).unsqueeze(0)
+                    amp = sA_i.unsqueeze(-1) * cA_j.unsqueeze(0).unsqueeze(0)
 
-            C[:, t_start:t_end, :] = 2.0 * (
-                amp * torch.sinc(2.0 * df) * torch.cos(dphi)
-            ).sum(dim=(2, 4))
+                    C[:, t_start:t_end, :] += 2.0 * amp * torch.sinc(2.0 * df) * torch.cos(dphi)
 
         return C
 
