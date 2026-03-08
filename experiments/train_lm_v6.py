@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class Config:
     num_harmonics: int = 7
-    vocab_size: int = 10000
+    vocab_size: int = 3000
     min_freq: int = 2
     seq_len: int = 32
     batch_size: int = 8
