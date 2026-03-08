@@ -45,7 +45,7 @@ class WaveEmbeddingV6(nn.Module):
         self.amplitudes = nn.Parameter(
             torch.ones(vocab_size) + torch.randn(vocab_size) * 0.1
         )
-        self.phase = nn.Parameter(torch.zeros(vocab_size))
+        self.phase = nn.Parameter(torch.randn(vocab_size) * 0.3)
         self.scale_mix = nn.Parameter(torch.zeros(vocab_size))  # sigmoid logit
 
         # Global harmonic decay per band
