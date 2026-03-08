@@ -55,7 +55,11 @@ class SkipGramDataset(Dataset):
                         continue
                     self.pairs.append((target, context))
 
-        # Build negative sampling distribution: unigram^(3/4)
+        # Store pairs as contiguous numpy array for fast indexing
+        self.pairs_array = np.array(self.pairs, dtype=np.int64)
+
+        # Build negative sampling table (word2vec-style unigram table)
+        # Much faster than np.random.choice with probabilities
         word_counts = np.maximum(word_counts, 0)
         powered = np.power(word_counts, 0.75)
         # Zero out special tokens
@@ -64,23 +68,35 @@ class SkipGramDataset(Dataset):
                 powered[sid] = 0.0
         total = powered.sum()
         if total > 0:
-            self.neg_probs = powered / total
+            probs = powered / total
         else:
-            self.neg_probs = np.ones(vocab.size) / vocab.size
+            probs = np.ones(vocab.size) / vocab.size
+
+        # Build unigram table for O(1) sampling (word2vec approach)
+        table_size = 10_000_000
+        self.neg_table = np.zeros(table_size, dtype=np.int64)
+        idx = 0
+        cumulative = 0.0
+        for word_id in range(len(probs)):
+            cumulative += probs[word_id]
+            while idx < table_size and idx / table_size < cumulative:
+                self.neg_table[idx] = word_id
+                idx += 1
+        # Fill any remaining slots
+        if idx < table_size:
+            self.neg_table[idx:] = self.neg_table[idx - 1]
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.pairs_array)
 
     def __getitem__(self, idx):
-        target, positive = self.pairs[idx]
+        pair = self.pairs_array[idx]
+        target = pair[0]
+        positive = pair[1]
 
-        # Sample negatives
-        negatives = np.random.choice(
-            len(self.neg_probs),
-            size=self.num_negatives,
-            replace=True,
-            p=self.neg_probs,
-        )
+        # Fast negative sampling via table lookup
+        table_idx = np.random.randint(0, len(self.neg_table), size=self.num_negatives)
+        negatives = self.neg_table[table_idx]
 
         return (
             torch.tensor(target, dtype=torch.long),
