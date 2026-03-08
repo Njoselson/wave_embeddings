@@ -35,13 +35,13 @@ class Config:
     num_harmonics: int = 7
     vocab_size: int = 10000
     min_freq: int = 2
-    seq_len: int = 64
-    batch_size: int = 32
+    seq_len: int = 32
+    batch_size: int = 8
     num_epochs: int = 20
     lr: float = 1e-3
     freq_lr: float = 3e-4
     eval_every: int = 5
-    chunk_size: int = 16
+    chunk_size: int = 4
     use_wikitext: bool = True
     device: str = "auto"
     contrastive_checkpoint: str | None = None
