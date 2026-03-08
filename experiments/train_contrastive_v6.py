@@ -181,15 +181,11 @@ def main():
     )
     log.info("Dataset: %s pairs in %.1fs", f"{len(dataset):,}", time.time() - t0)
 
-    loader = DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        drop_last=True,
-    )
+    # Load entire dataset onto GPU for zero-overhead data loading
+    all_pairs = torch.from_numpy(dataset.pairs_array).to(device)  # (N, 2)
+    neg_table = torch.from_numpy(dataset.neg_table).to(device)    # (10M,)
+    num_pairs = all_pairs.shape[0]
+    log.info("Loaded %s pairs + neg table onto %s", f"{num_pairs:,}", device)
 
     model = SkipGramV6(
         vocab_size=vocab.size,
@@ -216,12 +212,13 @@ def main():
 
     freq_slow_init = model.embedding.freq_slow.data.cpu().clone()
     freq_fast_init = model.embedding.freq_fast.data.cpu().clone()
-    batches_per_epoch = len(loader)
+    batches_per_epoch = (num_pairs + cfg.batch_size - 1) // cfg.batch_size
     log.info("Training: %d epochs, %d batches/epoch, freq_lr=%s, lr=%s",
              cfg.num_epochs, batches_per_epoch, cfg.freq_lr, cfg.lr)
     log.info("-" * 80)
 
     train_start = time.time()
+    neg_table_size = neg_table.shape[0]
 
     for epoch in range(cfg.num_epochs):
         model.train()
@@ -229,10 +226,17 @@ def main():
         num_batches = 0
         t0 = time.time()
 
-        for target, pos, neg in loader:
-            target = target.to(device)
-            pos = pos.to(device)
-            neg = neg.to(device)
+        # Shuffle pairs each epoch via random permutation on GPU
+        perm = torch.randperm(num_pairs, device=device)
+
+        for start in range(0, num_pairs - cfg.batch_size + 1, cfg.batch_size):
+            batch_idx = perm[start : start + cfg.batch_size]
+            batch_pairs = all_pairs[batch_idx]  # (B, 2)
+            target = batch_pairs[:, 0]
+            pos = batch_pairs[:, 1]
+            # Sample negatives entirely on GPU
+            neg_idx = torch.randint(0, neg_table_size, (cfg.batch_size, cfg.num_negatives), device=device)
+            neg = neg_table[neg_idx]  # (B, num_neg)
 
             optimizer.zero_grad()
             pos_e, neg_e = model(target, pos, neg)
@@ -250,7 +254,7 @@ def main():
             total_loss += loss.item()
             num_batches += 1
 
-            if num_batches % 50 == 0:
+            if num_batches % 200 == 0:
                 log.info("  batch %d/%d | loss=%.4f",
                          num_batches, batches_per_epoch, total_loss / num_batches)
 
