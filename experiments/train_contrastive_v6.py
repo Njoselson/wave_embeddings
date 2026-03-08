@@ -133,6 +133,10 @@ def main():
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--no-diversity", action="store_true",
+                        help="Disable frequency diversity regularizer")
+    parser.add_argument("--save-suffix", type=str, default="",
+                        help="Suffix for checkpoint filename")
     args = parser.parse_args()
 
     cfg = Config()
@@ -148,6 +152,8 @@ def main():
         cfg.num_epochs = args.epochs
     if args.device is not None:
         cfg.device = args.device
+    if args.no_diversity:
+        cfg.freq_diversity_weight = 0.0
 
     if cfg.device == "auto":
         if torch.cuda.is_available():
@@ -288,7 +294,8 @@ def main():
     log.info("Done in %.1fs (%.1fs/epoch)", total_time, total_time / cfg.num_epochs)
 
     os.makedirs("checkpoints", exist_ok=True)
-    save_path = "checkpoints/wave_contrastive_v6.pt"
+    suffix = args.save_suffix if args.save_suffix else ""
+    save_path = f"checkpoints/wave_contrastive_v6{suffix}.pt"
     torch.save({
         "model_state": model.state_dict(),
         "vocab": vocab,
