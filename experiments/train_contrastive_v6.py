@@ -41,7 +41,7 @@ class Config:
     min_freq: int = 2
     window_size: int = 5
     num_negatives: int = 15
-    batch_size: int = 16384
+    batch_size: int = 8192
     num_epochs: int = 20
     lr: float = 1e-3
     freq_lr: float = 3e-4
