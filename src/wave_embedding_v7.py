@@ -223,10 +223,8 @@ class SpectralStateLM(nn.Module):
     ) -> torch.Tensor:
         """Score all vocab tokens against the spectral state.
 
-        Score = sum_s sum_k state_amp[s,k] * delta_amp[v,s,k] * cos(state_phase[s,k] - delta_phase[v,s,k])
-
-        This measures spectral coherence: how much the candidate token's
-        perturbation is "in phase" with what the context expects.
+        Uses the identity: a*b*cos(p-q) = (a*cos(p))*(b*cos(q)) + (a*sin(p))*(b*sin(q))
+        This avoids materializing (B, V, S, K) by using matrix multiply instead.
 
         Args:
             state: SpectralState with amplitudes/phases (batch, num_scales, K)
@@ -234,23 +232,23 @@ class SpectralStateLM(nn.Module):
         Returns:
             logits: (batch, vocab_size)
         """
-        # state.amplitudes: (B, S, K)
-        # self.embedding.delta_amp: (V, S, K)
-        # state.phases: (B, S, K)
-        # self.embedding.delta_phase: (V, S, K)
+        S, K = self.embedding.num_scales, self.embedding.K
 
+        # State vectors: (B, S*K) via cos/sin decomposition
         s_amp = state.amplitudes      # (B, S, K)
         s_phase = state.phases        # (B, S, K)
-        v_amp = self.embedding.delta_amp    # (V, S, K)
+        s_real = (s_amp * torch.cos(s_phase)).view(-1, S * K)  # (B, S*K)
+        s_imag = (s_amp * torch.sin(s_phase)).view(-1, S * K)  # (B, S*K)
+
+        # Vocab vectors: (V, S*K)
+        v_amp = self.embedding.delta_amp      # (V, S, K)
         v_phase = self.embedding.delta_phase  # (V, S, K)
+        v_real = (v_amp * torch.cos(v_phase)).view(-1, S * K)  # (V, S*K)
+        v_imag = (v_amp * torch.sin(v_phase)).view(-1, S * K)  # (V, S*K)
 
-        # Broadcast: (B, 1, S, K) * (1, V, S, K) * cos(...)  → (B, V, S, K) → sum → (B, V)
-        phase_diff = s_phase.unsqueeze(1) - v_phase.unsqueeze(0)  # (B, V, S, K)
-        coherence = (
-            s_amp.unsqueeze(1) * v_amp.unsqueeze(0) * torch.cos(phase_diff)
-        )  # (B, V, S, K)
+        # Score = s_real @ v_real.T + s_imag @ v_imag.T  →  (B, V)
+        logits = s_real @ v_real.t() + s_imag @ v_imag.t()
 
-        logits = coherence.sum(dim=(-2, -1))  # (B, V)
         return logits / (self.temperature.abs() + 1e-6)
 
     def forward(
