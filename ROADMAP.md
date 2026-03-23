@@ -86,87 +86,56 @@ Every experiment going forward must be evaluated against these four criteria:
 
 **Implication:** The next experiment should be the *simplest possible* change that addresses the v5→v6 regression, not the most feature-rich.
 
-## Phase 1.5: Closing the Benchmark Gap (Current)
+## Phase 1.5: Spectral State Models (Current)
 
-**Goal:** Beat v5's WS-353 rho of 0.23. Target: >0.3.
+### v7: Spectral Perturbations with MLM (COMPLETE)
 
-### The v5 vs v6 paradox
+Fundamental rethink: tokens are spectral PERTURBATIONS to a running state, not static waves. Bidirectional MLM with cross-entropy loss.
 
-v5 (2 params/token, LM objective) scored 0.23 on WS-353.
-v6 (5 params/token, skip-gram + diversity reg) scored -0.06.
+- [x] Architecture: `SpectralState`, `SpectralEmbedding`, `SpectralStateLM` (`src/wave_embedding_v7.py`)
+- [x] Efficient scoring via cos/sin decomposition: `(B, S*K) @ (S*K, V)` matmul
+- [x] MLM training on WikiText-2 (`experiments/train_spectral_v7.py`)
+- [x] Capacity scaling: K=4 (24p/tok), K=8 (48p/tok), K=16 (96p/tok)
+- [x] PPL 706 — 2.2x better than v5's 1,563
+- [x] Strong word pairs: war/battle +0.90, man/woman +0.42
+- [x] WS-353 eval (`experiments/eval_v7.py`)
 
-More params + more features = worse generalization. Three suspects:
-1. **Objective**: LM cross-entropy (v5) vs skip-gram contrastive (v6)
-2. **Regularizer**: v6's diversity loss fights the similarity objective
-3. **Architecture complexity**: v6 has too many interacting parts
+**Key findings:**
+- Capacity doesn't matter: K=4/8/16 all hit PPL 706. The bottleneck is the linear state evolution, not embedding dimension.
+- Word pairs peak at epoch 10-15 then degrade (MLM overfitting)
+- WS-353 still negative — function words cluster near +1.0 similarity
+- Multi-scale decay self-organizes: long=0.96, mid=0.63, short=0.12
 
-### Experiment plan: isolate one variable at a time
+### v7.1: Gated State Updates (IN PROGRESS)
 
-**Experiment A: v5 architecture + skip-gram** (isolate objective)
-- [ ] Train v5 (2 params, 7 harmonics) with skip-gram objective (same as v6 training)
-- [ ] No diversity regularizer
-- [ ] Compare WS-353 rho against v5-LM (0.23) and v6-contrastive (-0.06)
-- [ ] If rho drops: LM objective is the key ingredient
-- [ ] If rho holds: v6's architecture/regularizer is the problem
+The linear recurrence `state = decay * state + delta` is the expressiveness bottleneck. Content-dependent gating adds selective memory.
 
-**Experiment B: v6 architecture + LM objective** (isolate architecture)
-- [ ] Train v6 (5 params, dual-band) with LM cross-entropy (same as v5 training)
-- [ ] No diversity regularizer
-- [ ] Compare against v5-LM (0.23)
-- [ ] If rho improves: more params + LM = the path forward
-- [ ] If rho drops: v6's added complexity (dual-band, phase) actively hurts
+- [x] Architecture: `GatedSpectralStateLM` (`src/wave_embedding_v7_1.py`)
+- [x] Gate = sigmoid(token_bias + sensitivity * coherence(state, perturbation))
+- [x] Per-token gate_bias: function words learn to pass through, content words learn to overwrite
+- [x] Training script (`experiments/train_spectral_v7_1.py`)
+- [ ] Train on WikiText-2 and compare PPL against v7
+- [ ] Monitor gate bias divergence (function vs content words)
+- [ ] Does PPL break below 700?
 
-**Experiment C: v6 skip-gram without diversity loss** (isolate regularizer)
-- [ ] Exact v6 contrastive setup but `freq_diversity_weight=0.0`
-- [ ] Quickest test — only changes one config value
-- [ ] If rho jumps: diversity loss was the problem all along
+### v7.2: Complex-Native Tensors (PLANNED)
 
-**Run order:** C first (cheapest), then A, then B.
+The cos/sin decomposition is implicitly complex arithmetic. Making it explicit simplifies the code and enables native complex matmul.
 
-### If the objective matters most (LM > skip-gram)
+- [ ] State as complex tensor: `z = amp * exp(j * phase)` — (B, S, K) complex64
+- [ ] Perturbation as complex: `delta = delta_amp * exp(j * delta_phase)`
+- [ ] State update: complex multiply/add instead of separate amp/phase arithmetic
+- [ ] Scoring: `Re(state @ conj(vocab).T)` — single complex matmul
+- [ ] Gated update: `state = gate * state + (1-gate) * delta` works directly on complex tensors
+- [ ] Potential benefit: cleaner gradients through complex autograd, simpler code
 
-The sinc scoring function in skip-gram may be the issue:
-- `sinc(2*Δf)` oscillates — two tokens with Δf=1.5 have *negative* sinc, creating false repulsion
-- LM cross-entropy uses sinc indirectly through logits, softmax smooths the landscape
-- Consider: replace sinc with Gaussian kernel `exp(-Δf²/σ²)` — monotonically decreasing, no oscillation, still differentiable
+### Future: Parallel State Computation
 
-### If capacity matters (need more params)
+The sequential state loop (O(T) serial steps) is a speed bottleneck. The linear recurrence `state = a * state + b` can be parallelized via prefix scan in O(log T). The gated version (v7.1) makes this harder but Mamba showed it's possible with input-dependent state transitions.
 
-Scale params/token gradually: 2 → 4 → 8 → 16. Don't jump to 5 with 3 new features at once.
-- [ ] v5 with 2 frequencies + 2 amplitudes = 4 params (simplest capacity increase)
-- [ ] v5 with 4 frequencies + 4 amplitudes = 8 params
-- [ ] Plot WS-353 rho vs params/token — find the knee
-
-### Evaluation improvements
-- [ ] Fix SimLex-999 parsing (format mismatch in current eval)
-- [ ] Ensure identical vocab coverage across v5 and v6 evals
-- [ ] Per-category analysis: which semantic relationships does wave interference capture vs miss?
-
-## Phase 2: Language Modeling with Wave Embeddings
-
-**Goal:** Use wave embeddings for next-token prediction without requiring O(T * V * H²) scoring.
-
-v5 LM achieved PPL 1,563 (6.4× over random) but OOM'd v6 on 8GB. The scoring mechanism must be efficient.
-
-### Approach A: Wave embeddings as drop-in layer (simplest, tests embedding quality)
-- [ ] Freeze trained wave embeddings, project to d-dim vector via small linear layer
-- [ ] Feed into standard small transformer (2-4 layers, d=128-256)
-- [ ] Compare perplexity vs randomly initialized embeddings of same total param count
-- [ ] **Inference**: still fast — wave lookup + small linear projection + small transformer
-- [ ] **Complexity**: minimal — just add a projection layer, no new objectives
-- [ ] This answers: does the wave representation encode more information per parameter?
-
-### Approach B: Gaussian kernel scoring (smoother objective, same architecture)
-- [ ] Replace `sinc(2*Δf)` with `exp(-Δf²/σ²)` in the energy function
-- [ ] Monotonically decreasing with frequency distance — no oscillatory local minima
-- [ ] Same O(T*V*H²) cost but smoother loss landscape may allow larger learning rates
-- [ ] σ is a learnable or tunable parameter
-
-### Approach C: Predict wave params directly (fast inference)
-- [ ] Context → predicted (f, A) for next token via small MLP
-- [ ] Nearest-neighbor lookup in wave param space to find the token
-- [ ] **Inference**: O(V) distance comparisons in low-dim space, or O(log V) with ANN index
-- [ ] Avoids scoring all vocab through interference — decouples generation from wave math
+- [ ] Implement parallel scan for linear recurrence (v7)
+- [ ] Investigate selective scan for gated recurrence (v7.1)
+- [ ] Benchmark: sequential vs parallel on GPU for T=64, 128, 256
 
 ## Phase 3: Multilingual & Universal Frequencies
 
@@ -198,15 +167,17 @@ v5 LM achieved PPL 1,563 (6.4× over random) but OOM'd v6 on 8GB. The scoring me
 3. **Architecture choice** — v3 (complex exponentials, no harmonics) validated as best approach
 4. **Frequency collapse** — diversity regularizer prevents it, but needs annealing to avoid hurting semantics
 5. **Phase learning** — requires non-zero initialization; zero init is a saddle point with zero gradient
-6. **LM feasibility** — direct wave interference scoring is O(T*V*H^2), impractical; need approximate methods
+6. **LM feasibility** — cos/sin decomposition solves the O(T*V*H^2) scoring bottleneck via matmul
+7. **Optimal params/token for LM** — capacity is NOT the bottleneck; K=4/8/16 all hit same PPL. The linear state evolution is the limiter.
+8. **LM vs skip-gram** — MLM cross-entropy (v7) dramatically outperforms skip-gram contrastive (v6)
 
 ### Open
-1. **Optimal params/token:** 5 isn't enough for benchmarks. Where's the sweet spot between 5 and 300?
-2. **Composition beyond addition:** Negation, binding, and other non-additive semantics.
-3. **Positional encoding:** Waves encode position implicitly via phase — is this sufficient?
-4. **Scaling laws:** How does performance scale with number of waves and corpus size?
-5. **Interference energy scaling:** Does the energy metric need normalization for varying-length sequences?
-6. **Why does generalization fail?** Hand-picked pairs work, benchmarks don't — is this overfitting to high-frequency co-occurrence pairs, or a fundamental limitation of the similarity metric?
+1. **Does gating break the PPL plateau?** v7.1 adds content-dependent gates — will PPL drop below 700?
+2. **Composition beyond addition:** Negation, binding, and other non-additive semantics. Gating is a step toward this.
+3. **Positional encoding:** Spectral state carries implicit position via decay. Is this sufficient for longer sequences?
+4. **Scaling laws:** Does WikiText-2 (2M tokens) saturate the model? Would WikiText-103 help?
+5. **Benchmark gap:** Strong word pairs but negative WS-353. Is `spectral_similarity` (raw perturbation comparison) the wrong metric? Should similarity be measured via contextual state instead?
+6. **Complex-native representation:** Does explicit complex arithmetic improve gradient flow or training stability?
 
 ## Technical Notes
 
