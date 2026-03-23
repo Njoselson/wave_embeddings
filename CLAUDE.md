@@ -10,20 +10,44 @@ Every fundamental communicable concept maps to a fundamental frequency — consi
 
 ## Architecture Summary
 
-### Current: v3 — Complex Exponential Wave Embeddings
-- Each token maps to 3 complex exponential waves (tunable via `num_waves`)
-- Each wave = 2 learnable scalars: frequency (f), amplitude (A) — 6 params/token
-- Uses complex exponentials z(t) = A * exp(j * 2pi * f * t) instead of real sinusoids
-- Key finding: frequencies only learn via complex exponentials (Hayes et al. 2022), not real sinusoids
-- Sequence composition: additive interference of per-token signals
-- Training: backprop through differentiable complex exponentials
-- Similarity metric: wave interference energy — constructive interference when frequencies match
-- Contrastive training: skip-gram with negative sampling using interference energy as score
+### Current: v7 — Spectral State Language Model
+- Tokens are spectral PERTURBATIONS to a running state, not static waves
+- Each token learns delta_amp + delta_phase at 3 scales × K freqs = 24 params/token (K=4)
+- Bidirectional: forward + backward spectral states combined at masked positions
+- Scoring via spectral coherence: `state_amp * token_amp * cos(state_phase - token_phase)`
+- Efficient cos/sin decomposition: `(B, S*K) @ (S*K, V)` matmul instead of broadcast
+- Per-scale learned decay: long-range (0.96), mid-range (0.63), short-range (0.12)
+- Training: MLM with cross-entropy loss (single optimizer, no regularizer)
+- Files: `src/wave_embedding_v7.py`, `experiments/train_spectral_v7.py`, `experiments/eval_v7.py`
 
-### Legacy: v1 (real sinusoids + harmonics)
-- 7 tone waves × 3 params (f, A, H) = 21 params/token
-- Harmonics with sigmoid envelope for differentiability
-- Frequencies did not learn meaningfully due to non-convex sin() landscape
+### v6 — Multi-scale Phase-aware Wave Interference (skip-gram)
+- 5 params/token (freq_slow, freq_fast, amplitude, phase, scale_mix)
+- Skip-gram + negative sampling with wave interference energy scoring
+- WS-353 rho: -0.06 (worse than v5 — complexity hurt generalization)
+
+### v5 — Single-frequency Wave LM
+- 2 params/token (frequency + amplitude), 7 harmonics
+- Language model with cross-entropy, PPL 1,563
+- WS-353 rho: 0.23 (best benchmark score before v7)
+
+### Legacy: v3 (complex exponentials), v1 (real sinusoids)
+
+## Experimental Results
+
+### v7 K=4 (24 params/token, 240K total) — WikiText-2 MLM
+- PPL: 706 (vs v5's 1,563 — 2.2x better)
+- MLM accuracy: 6.8% (random = 0.01%)
+- WS-353 rho: -0.05 (hand-picked pairs strong, benchmark weak)
+- Strong pairs: war/battle +0.90, city/town +0.71, good/great +0.64, man/woman +0.42
+- Problem: function words cluster near 1.0 (the/of +0.99), hurting benchmark correlation
+- Decay self-organized: long=0.964, mid=0.633, short=0.122
+- Loss plateaued at epoch 5 — 12 effective dims may be the bottleneck
+
+### Key design lessons (v5→v6→v7)
+1. Single objective > multiple losses (LM cross-entropy > skip-gram + regularizer)
+2. Simplicity wins: fewer optimizer groups, fewer hyperparameters
+3. Phase requires non-zero init (zero is a saddle point)
+4. cos/sin decomposition enables efficient scoring without (B,V,S,K) broadcast
 
 ## Tech Stack
 
@@ -36,12 +60,11 @@ Every fundamental communicable concept maps to a fundamental frequency — consi
 
 ## Key Design Decisions
 
-- v3: 3 complex exponential waves per token (6 params vs 768+ in transformers)
-- Complex exponentials provide smooth loss landscape for frequency learning
-- Frequency initialization: randn * 3.0 for diverse spread
-- Wave interference energy as similarity metric (physically motivated)
-- Contrastive (skip-gram) training to force frequency differentiation across tokens
-- Multilingual Wikipedia as primary dataset to test universal-frequency hypothesis
+- v7: tokens as spectral perturbations (24 params/token vs 768+ in transformers)
+- MLM with cross-entropy (smoother landscape than skip-gram contrastive)
+- Single Adam optimizer, single loss — no regularizers, no param group splits
+- cos/sin decomposition for memory-efficient scoring
+- WikiText-2 for monolingual experiments; multilingual Wikipedia planned for Phase 3
 
 ## Code Conventions
 
@@ -53,9 +76,11 @@ Every fundamental communicable concept maps to a fundamental frequency — consi
 
 ## Important Notes
 
-- `torch.fft.rfft` and `torch.fft.irfft` are fully differentiable — gradients flow through them
-- Complex exponentials exp(j*w*t) provide convex loss landscape for frequency (Hayes et al. 2022)
-- Frequency parameter gradients can be volatile — use lower learning rate or separate param groups for frequencies
-- Wave interference energy: E = A1² + A2² + 2·A1·A2·sinc(Δf) — cross-term is the similarity signal
-- Contrastive training uses negative sampling loss with interference energy as score
-- The existing `wave_embeddings_plan.md` contains an earlier iteration of the architecture with phase instead of harmonic-count; the Roadmap.md reflects the current direction
+- Phase init must be non-zero (randn * 0.3) — zero init is a saddle point with zero gradient
+- cos/sin decomposition: `a*b*cos(p-q) = (a*cos(p))*(b*cos(q)) + (a*sin(p))*(b*sin(q))` — enables matmul scoring
+- Spectral coherence similarity is normalized: `coherence / (norm1 * norm2)`
+- GPU data loading: move entire dataset + neg table to GPU tensors for 97% utilization
+- Vast.ai: RTX 3060 12GB at $0.046/hr sufficient for v7 training; avoid Blackwell GPUs (no PyTorch support)
+- Benchmark URLs: WS-353 and SimLex-999 via Dropbox (old GitHub repo is dead)
+- SimLex-999 eval returns 0 pairs — format parsing issue unresolved
+- See ROADMAP.md for full experimental history and next steps

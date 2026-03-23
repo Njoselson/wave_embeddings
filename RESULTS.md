@@ -14,6 +14,7 @@ This document covers the full experimental history across 4 architecture version
 | v4 | 6/char | character | 3 waves per char, positional shift for word composition |
 | v5 | 2 | token | 1 frequency + 1 amplitude, 7 harmonics |
 | v6 | 5 | token | Dual-band (slow+fast), phase, diversity regularization |
+| v7 | 24-96 | token | Spectral perturbations to running state, MLM training |
 
 ### v3: Complex Exponentials (Phase 0)
 - 3 waves × 2 params (f, A) = 6 params/token
@@ -382,8 +383,126 @@ The LM forward pass computes wave interference between every sequence position a
 
 Total vast.ai compute cost for all experiments: approximately **$2-3** (RTX 3060 Ti at $0.063/hr for ~30-40 hours including idle time).
 
+## v7 Results: Spectral State Language Model
+
+### Architecture
+
+v7 represents a fundamental rethink: tokens are **spectral perturbations** to a running state, not static waves. Each token learns `delta_amp` and `delta_phase` at multiple scales and frequencies. A bidirectional spectral state (forward + backward) is built from unmasked tokens, and masked positions are scored via **spectral coherence** against all vocab tokens.
+
+| Parameter | Description |
+|-----------|-------------|
+| `delta_amp` | (vocab, num_scales, K) — amplitude perturbation per scale/freq |
+| `delta_phase` | (vocab, num_scales, K) — phase perturbation per scale/freq |
+| `decay_logits` | (num_scales,) — per-scale decay rate, constrained via sigmoid |
+| `combine_weight` | scalar — forward/backward balance |
+| `temperature` | scalar — logit scaling |
+
+Training: masked language model (MLM) with cross-entropy loss. Single Adam optimizer, no regularizer. This follows the design principle that emerged from v5→v6: simpler objectives generalize better.
+
+**Scoring efficiency:** Uses the identity `a*b*cos(p-q) = (a*cos(p))*(b*cos(q)) + (a*sin(p))*(b*sin(q))` to replace a `(B, V, S, K)` broadcast with two small matmuls `(B, S*K) @ (S*K, V)`. This avoids the O(T*V*H²) bottleneck that plagued v5/v6 LM training.
+
+### Capacity Scaling Experiment
+
+Trained on WikiText-2 (2.08M tokens, 10K vocab, seq_len=64) with 3 scales and varying K (frequencies per scale). Hardware: RTX 3060 (12GB) via vast.ai.
+
+| Config | K | Params/Token | Total Params | Epochs | PPL | MLM Acc |
+|--------|---|-------------|-------------|--------|-----|---------|
+| K=4 | 4 | 24 | 240K | 20 | 706 | 6.8% |
+| K=8 | 8 | 48 | 480K | 20 | 706 | 6.8% |
+| K=16 | 16 | 96 | 960K | 20 | 706 | 6.8% |
+| K=8 | 8 | 48 | 480K | 50 | 698 | 6.8% |
+
+**Finding: PPL is identical across all capacities.** Doubling or quadrupling params per token did not improve perplexity. The model is not capacity-limited — something else is the bottleneck (likely the sequential RNN-like state building or dataset size).
+
+### Word Pair Similarities
+
+| Pair | K=4 (20ep) | K=8 (20ep) | K=16 (20ep) | K=8 (50ep) |
+|------|-----------|-----------|------------|-----------|
+| war - battle | **+0.90** | +0.54 | +0.33 | +0.42 |
+| city - town | **+0.71** | +0.61 | +0.45 | +0.34 |
+| good - great | **+0.64** | +0.50 | +0.39 | +0.26 |
+| man - woman | **+0.42** | +0.39 | -0.01 | +0.10 |
+| king - queen | -0.03 | **+0.29** | -0.01 | -0.15 |
+| sun - moon | -0.03 | **+0.41** | -0.14 | -0.27 |
+| cat - dog | +0.18 | **+0.28** | +0.07 | +0.19 |
+| boy - girl | +0.08 | **+0.16** | +0.21 | -0.03 |
+| cat - the | -0.57 | -0.33 | -0.30 | -0.31 |
+| he - she | +0.94 | +0.92 | +0.80 | — |
+| is - was | +0.98 | +0.96 | +0.93 | — |
+| the - of | +0.99 | +0.98 | +0.99 | — |
+
+**K=4** has the strongest peaks on obvious co-occurrence pairs (war/battle, city/town).
+**K=8** has the best coverage of subtle relationships (king/queen, sun/moon, cat/dog).
+**K=16** underperforms — more parameters need more data or training.
+**K=8 at 50 epochs** shows **degradation** — word pair quality peaked around epoch 10-15, then the model overfit to the MLM objective.
+
+### Benchmark: WordSim-353
+
+| Model | Params/Token | WS-353 rho |
+|-------|-------------|------------|
+| Word2Vec-300d | 300 | ~0.65 |
+| WaveLM v5 | 2 | **0.23** |
+| Wave v6 (phase) | 5 | -0.06 |
+| **Wave v7 K=4** | **24** | -0.05 |
+| **Wave v7 K=8** | **48** | -0.08 |
+| **Wave v7 K=16** | **96** | -0.06 |
+
+Benchmark scores remain poor despite strong hand-picked pairs. Root cause: function words (the/of, is/was, he/she) all cluster near similarity +0.95-0.99, inflating scores for many benchmark pairs that should be dissimilar. The `spectral_similarity` metric (which compares perturbation vectors directly) doesn't capture the same distributional information as the contextual spectral state.
+
+### Learned Decay Values
+
+The per-scale decay rates self-organized consistently across all runs:
+
+| Scale | Init | K=4 (20ep) | K=8 (20ep) | K=16 (20ep) | K=8 (50ep) |
+|-------|------|-----------|-----------|------------|-----------|
+| Long-range | 0.881 | 0.964 | 0.957 | 0.944 | 0.973 |
+| Mid-range | 0.500 | 0.633 | 0.464 | 0.426 | 0.252 |
+| Short-range | 0.119 | 0.122 | 0.119 | 0.113 | 0.084 |
+
+**Observations:**
+- Long-range decay pushed toward 1.0 in all runs — the model wants long memory at the coarsest scale
+- Mid-range decay **collapsed toward zero with more epochs** (0.633 → 0.252 at 50ep) — the model found mid-range scale less useful over time
+- Short-range stayed near initialization — very fast decay for local syntax is already optimal
+- Temperature increased from ~0.6 to ~1.9 over 50 epochs — the model's logit confidence grew steadily
+
+### v7 vs Previous Versions
+
+| Metric | v5 (2p/tok) | v6 (5p/tok) | v7 K=4 (24p/tok) |
+|--------|------------|------------|-----------------|
+| Training | LM (cross-ent) | Skip-gram + diversity | MLM (cross-ent) |
+| LM PPL | 1,563 | — | **706** |
+| WS-353 rho | **0.23** | -0.06 | -0.05 |
+| war/battle | +0.86 | — | **+0.90** |
+| man/woman | +0.01 | +0.84 | +0.42 |
+| king/queen | +0.03 | +0.10 | -0.03 |
+| Total params | 20K | 50K | 240K |
+| Scoring cost | O(T*V*H²) | O(V*H²) | O(V*S*K) matmul |
+
+**v7's key advances:**
+1. **2.2x better perplexity** than v5 (706 vs 1,563) with efficient scoring
+2. **No OOM** — cos/sin decomposition makes scoring cheap, unlike v5/v6 LM which hit memory limits
+3. **Multi-scale decay self-organizes** — the model discovers long/short memory without manual tuning
+4. **Bidirectional context** — forward + backward states combined via learned weight (converges to ~0.50)
+
+**v7's persistent issues:**
+1. WS-353 benchmark still negative — the similarity metric isn't right for benchmarks
+2. PPL plateaus early regardless of capacity — the sequential state building may be the bottleneck
+3. Word pair quality degrades with extended training (MLM overfitting)
+
+### Key Takeaways
+
+1. **The spectral state paradigm works.** Tokens as perturbations to a running state is more expressive than static wave parameters, achieving 2.2x better perplexity.
+
+2. **Capacity is not the bottleneck.** K=4, K=8, and K=16 all achieve identical PPL. The sequential state building (RNN-like loop) likely limits what the model can learn.
+
+3. **MLM overfitting is real.** Word pair quality peaks around epoch 10-15 and then degrades as the model specializes for token prediction at the expense of general semantic structure. This suggests the similarity metric (direct perturbation comparison) diverges from what the model actually learns (contextual prediction).
+
+4. **The benchmark gap persists.** Strong hand-picked pairs but negative WS-353 correlation. Function words clustering near 1.0 is the proximate cause, but the deeper issue is that `spectral_similarity` (comparing perturbation vectors) doesn't reflect how the model actually uses those perturbations in context.
+
 ## Next Steps
 
-- Investigate frequency diversity regularizer scheduling (anneal weight to zero in later epochs)
-- Use wave embeddings as a frozen embedding layer in a small transformer to test downstream task performance
-- Explore approximate nearest-neighbor in frequency space for efficient LM scoring
+- Investigate why capacity doesn't help — is the RNN-like sequential state building the bottleneck?
+- Consider parallel state computation (scan operations) for faster training
+- Explore context-dependent similarity (score tokens via their effect on spectral state, not raw perturbation comparison)
+- Learning rate scheduling (cosine decay) to prevent late-training drift
+- Larger dataset (WikiText-103 or full Wikipedia) to test if data quantity breaks the plateau
